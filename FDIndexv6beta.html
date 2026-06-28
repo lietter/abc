@@ -3668,7 +3668,7 @@ async function _newFolder(name,) {
     chdir(null);
 }
 
-async function zipping_request(e,) {
+async function zipping_request(e) {
     if (document.getElementById("progress-bar").style.display !== "none") {
         return;
     }
@@ -3680,79 +3680,140 @@ async function zipping_request(e,) {
     }
 
     toggleAnimation(true);
-    fetchingStatusBar.displayInfo("正在打包文件夹...");
+    fetchingStatusBar.displayInfo("正在准备打包任务...");
 
     try {
-        await _zipping_request(e, item,);
+        await _zipping_request(item);
     } finally {
         toggleAnimation(false);
     }
 }
 
-function getFilenameFromDisposition(contentDisposition, fallbackName,) {
-    if (!contentDisposition) return fallbackName;
-
-    const utf8Match = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-    if (utf8Match && utf8Match[1]) {
-        try {
-            return decodeURIComponent(utf8Match[1]);
-        } catch (e) {}
-    }
-
-    const normalMatch = contentDisposition.match(/filename\s*=\s*"([^"]+)"/i)
-        || contentDisposition.match(/filename\s*=\s*([^;]+)/i);
-
-    if (normalMatch && normalMatch[1]) {
-        return normalMatch[1].trim().replace(/^"|"$/g, "");
-    }
-
-    return fallbackName;
+function triggerBrowserDownload(url) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.rel = "noopener noreferrer";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
 }
 
-async function _zipping_request(e, source,) {
+async function postZipAction(payload) {
     const baseUrl = new URL(window.location.href.replace(/#$/, ""));
-    const fallbackName = ((source && source.item_attr && source.item_attr.name) ? source.item_attr.name : "download") + ".zip";
+    const response = await fetch(baseUrl.href, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        body: JSON.stringify(payload),
+    });
+
+    const text = await response.text();
+    let data = {};
+    try {
+        data = JSON.parse(text || "{}");
+    } catch (e) {
+        throw new Error(`Invalid JSON response: ${response.status}`);
+    }
+
+    if (!response.ok && data.ok !== true) {
+        throw new Error(data.message || `HTTP ${response.status}`);
+    }
+
+    return data;
+}
+
+async function requestZipPrepare(sourcePath) {
+    return await postZipAction({
+        action: "zip_prepare",
+        source: sourcePath,
+    });
+}
+
+async function requestZipStatus(jobId) {
+    return await postZipAction({
+        action: "zip_status",
+        job_id: jobId,
+    });
+}
+
+async function waitZipReady(jobId, initialPollAfter = 3000) {
+    let pollAfter = initialPollAfter || 3000;
+    const started = Date.now();
+    const timeoutMs = 30 * 60 * 1000;
+
+    while (true) {
+        if (Date.now() - started > timeoutMs) {
+            throw new Error("ZIP task timeout");
+        }
+
+        await new Promise(resolve => setTimeout(resolve, pollAfter));
+
+        const result = await requestZipStatus(jobId);
+
+        if (!result.ok) {
+            throw new Error(result.message || "ZIP status failed");
+        }
+
+        if (result.status === "ready" && result.download_url) {
+            return result;
+        }
+
+        if (result.status === "failed") {
+            throw new Error(result.message || "ZIP build failed");
+        }
+
+        if (result.status === "expired") {
+            throw new Error(result.message || "ZIP expired");
+        }
+
+        if (result.status === "queued") {
+            fetchingStatusBar.displayInfo("任务排队中，请稍候...");
+        } else {
+            fetchingStatusBar.displayInfo("正在打包文件夹，请稍候...");
+        }
+
+        pollAfter = result.poll_after || pollAfter;
+    }
+}
+
+async function _zipping_request(source) {
+    const sourcePath = getFullPath(source);
 
     try {
-        const response = await fetch(baseUrl.href, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Accept": "application/zip, application/octet-stream;q=0.9, application/json;q=0.8, text/plain;q=0.7",
-            },
-            body: JSON.stringify({
-                action: "zip",
-                source: getFullPath(source),
-            }),
-        });
+        const prepare = await requestZipPrepare(sourcePath);
 
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+        if (!prepare.ok) {
+            throw new Error(prepare.message || "ZIP prepare failed");
         }
 
-        const blob = await response.blob();
-        if (!blob || blob.size === 0) {
-            throw new Error("Empty zip response");
+        if (prepare.status === "ready" && prepare.download_url) {
+            fetchingStatusBar.displayInfo("已命中缓存压缩包，开始下载...", -1, 3000);
+            triggerBrowserDownload(prepare.download_url);
+            return;
         }
 
-        const contentDisposition = response.headers.get("Content-Disposition");
-        const filename = getFilenameFromDisposition(contentDisposition, fallbackName,);
-
-        const objectUrl = URL.createObjectURL(blob);
-        try {
-            const a = document.createElement("a");
-            a.href = objectUrl;
-            a.download = filename;
-            a.rel = "noopener noreferrer";
-            a.style.display = "none";
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        } finally {
-            setTimeout(() => URL.revokeObjectURL(objectUrl), 60 * 1000);
+        const jobId = prepare.job && prepare.job.id;
+        if (!jobId) {
+            throw new Error("Missing ZIP job id");
         }
 
-        fetchingStatusBar.displayInfo("已发起下载请求...", -1, 5000);
+        if (prepare.status === "queued") {
+            fetchingStatusBar.displayInfo("任务排队中，请稍候...");
+        } else {
+            fetchingStatusBar.displayInfo("正在打包文件夹，请稍候...");
+        }
+
+        const ready = await waitZipReady(jobId, prepare.poll_after || 3000);
+
+        if (!ready.download_url) {
+            throw new Error("Missing ZIP download url");
+        }
+
+        fetchingStatusBar.displayInfo("压缩包已就绪，开始下载...", -1, 3000);
+        triggerBrowserDownload(ready.download_url);
     } catch (error) {
         console.error("zip request failed:", error);
         fetchingStatusBar.displayInfo("打包失败...", 0, 6000);
